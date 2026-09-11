@@ -182,36 +182,92 @@ def save_dataset_to_mysql(db: Session, user_id: int, filename: str, df: pd.DataF
     """
     table_name = f"dataset_{user_id}"
 
-    # Rename columns to safe MySQL identifiers, keeping a map back to the
-    # original names so column roles still line up correctly.
+    # Rename columns to safe MySQL identifiers
     used_names: set = set()
     rename_map = {col: _safe_column_name(col, used_names) for col in df.columns}
     safe_df = df.rename(columns=rename_map)
 
-    # Drop the old table (if any) and create the new one from the DataFrame.
+    sqlalchemy_dtype = {
+        rename_map[col]: _sqlalchemy_type_for(df[col])
+        for col in df.columns
+    }
+
+    # Drop the old table
     with engine.begin() as conn:
         conn.execute(text(f"DROP TABLE IF EXISTS `{table_name}`"))
 
-    sqlalchemy_dtype = {
-        rename_map[col]: _sqlalchemy_type_for(df[col]) for col in df.columns
-    }
-    safe_df.to_sql(table_name, con=engine, if_exists="replace", index=False, dtype=sqlalchemy_dtype)
+    # ---------------------------------------------------------
+    # Create table manually with a PRIMARY KEY.
+    # Aiven requires every table to have a primary key.
+    # ---------------------------------------------------------
+    from sqlalchemy import MetaData, Table, Column, BigInteger
 
-    # Translate the detected roles (original column names) into the safe names.
+    metadata = MetaData()
+
+    columns = [
+        Column(
+            "_row_id",
+            BigInteger,
+            primary_key=True,
+            autoincrement=True
+        )
+    ]
+
+    for col in safe_df.columns:
+        columns.append(
+            Column(
+                col,
+                sqlalchemy_dtype[col]
+            )
+        )
+
+    dataset_table = Table(
+        table_name,
+        metadata,
+        *columns
+    )
+
+    metadata.create_all(engine)
+
+    # Insert the DataFrame rows into the already-created table.
+    safe_df.to_sql(
+        table_name,
+        con=engine,
+        if_exists="append",
+        index=False
+    )
+
+    # Translate detected roles into safe column names.
     safe_roles = {}
+
     for key, value in roles.items():
         if key.endswith("_columns") and isinstance(value, list):
-            safe_roles[key] = [rename_map[v] for v in value]
+            safe_roles[key] = [
+                rename_map[v] for v in value
+            ]
+
         elif key.endswith("_column") and value:
             safe_roles[key] = rename_map.get(value)
+
         else:
             safe_roles[key] = value
 
-    # Replace this user's previous dataset metadata (old table was already dropped above).
-    old_dataset_ids = [d.id for d in db.query(Dataset).filter(Dataset.user_id == user_id).all()]
+    # Replace this user's previous dataset metadata
+    old_dataset_ids = [
+        d.id
+        for d in db.query(Dataset)
+        .filter(Dataset.user_id == user_id)
+        .all()
+    ]
+
     if old_dataset_ids:
-        db.query(DatasetColumn).filter(DatasetColumn.dataset_id.in_(old_dataset_ids)).delete(synchronize_session=False)
-        db.query(Dataset).filter(Dataset.user_id == user_id).delete(synchronize_session=False)
+        db.query(DatasetColumn).filter(
+            DatasetColumn.dataset_id.in_(old_dataset_ids)
+        ).delete(synchronize_session=False)
+
+        db.query(Dataset).filter(
+            Dataset.user_id == user_id
+        ).delete(synchronize_session=False)
 
     missing = int(df.isnull().sum().sum())
     duplicate_rows = int(df.duplicated().sum())
@@ -225,23 +281,26 @@ def save_dataset_to_mysql(db: Session, user_id: int, filename: str, df: pd.DataF
         missing_values=missing,
         duplicate_rows=duplicate_rows,
     )
+
     db.add(dataset)
-    db.flush()  # assigns dataset.id before we insert the column rows
+    db.flush()
 
     role_by_column = _invert_roles(safe_roles)
+
     for col in safe_df.columns:
-        db.add(DatasetColumn(
-            dataset_id=dataset.id,
-            column_name=col,
-            data_type=str(safe_df[col].dtype),
-            role=role_by_column.get(col),
-        ))
+        db.add(
+            DatasetColumn(
+                dataset_id=dataset.id,
+                column_name=col,
+                data_type=str(safe_df[col].dtype),
+                role=role_by_column.get(col),
+            )
+        )
 
     db.commit()
     db.refresh(dataset)
+
     return dataset
-
-
 # ---------------------------------------------------------------------------
 # Step 6: load a user's active dataset back out of MySQL for analysis
 # ---------------------------------------------------------------------------
